@@ -1,0 +1,593 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>THE TERMINAL DREAMS</title>
+<style>
+  :root { --ph: #4dff88; --dim: rgba(77,255,136,.55); }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: #020604; color: var(--ph);
+    font-family: 'VT323', 'Courier New', monospace; font-size: 19px; line-height: 1.5; }
+  body::before { content:''; position: fixed; inset: 0; pointer-events: none; z-index: 50;
+    background: repeating-linear-gradient(0deg, rgba(0,0,0,.22) 0 1px, transparent 1px 3px); }
+  body::after { content:''; position: fixed; inset: 0; pointer-events: none; z-index: 51;
+    background: radial-gradient(ellipse at center, transparent 60%, rgba(0,0,0,.55) 100%); }
+  #wrap { max-width: 880px; margin: 0 auto; padding: 26px 18px 60px; }
+  .glow { text-shadow: 0 0 5px rgba(77,255,136,.45); }
+  #boot { white-space: pre-wrap; min-height: 200px; }
+  #screen { display: none; image-rendering: pixelated; width: 100%;
+    border: 1px solid rgba(77,255,136,.35); }
+  #inputline { display: none; margin-top: 12px; }
+  #q { background: transparent; border: none; outline: none; color: var(--ph);
+    font: inherit; width: 48%; caret-color: var(--ph); }
+  #q:disabled { opacity: .4; }
+  .modebtn { color: var(--dim); cursor: pointer; user-select: none; margin-left: 12px; }
+  .modebtn:hover { color: var(--ph); }
+  #caption { display: none; font-size: 15px; color: var(--dim); margin-top: 6px; font-style: italic; }
+  #status { display: none; font-size: 15px; color: var(--dim); margin-top: 10px; letter-spacing: .05em; }
+  .fine { font-size: 14px; color: var(--dim); margin-top: 26px;
+    border-top: 1px dashed var(--dim); padding-top: 8px; }
+  @keyframes blink { 50% { opacity: .25; } }
+  .cursor { animation: blink 1s steps(1) infinite; }
+</style>
+<link href="https://fonts.googleapis.com/css2?family=VT323&display=swap" rel="stylesheet">
+</head>
+<body>
+<div id="wrap" class="glow">
+  <div id="boot"></div>
+  <canvas id="screen"></canvas>
+  <div id="inputline">&gt; <input id="q" autocomplete="off" spellcheck="false" maxlength="120">
+    <span class="modebtn" id="btnG">[G] VOCABULARY</span><span class="modebtn" id="btnI">[I] IN-BETWEEN</span><span class="modebtn" id="btnR">[R] RECEIPT</span><span class="modebtn" id="btnM">[M] SOUND ON</span></div>
+  <div id="caption"></div>
+  <div id="status"></div>
+  <div class="fine">LAW 1 — EVERY GLYPH IS DREAMED LIVE BY A 2017 NEURAL NETWORK (THE MODEL FILE IN THIS FOLDER).
+LAW 2 — THE MACHINE HEARS NO LANGUAGE. YOUR WORDS ARE ONLY SEEDS.
+LAW 3 — ITS OUTPUT IS 28×28 PIXELS. IT IS SHOWN AT 28×28, MAGNIFIED AS A LOUPE, NOTHING INVENTED.
+LAW 4 — NOTHING IS CORRECTED.
+LAW 5 — THE SAME WORDS ALWAYS DREAM THE SAME DREAM.
+LAW 6 — THE IN-BETWEEN IS ALSO DREAMED. UNCERTAINTY IS SHOWN, NOT HIDDEN.
+LAW 7 — THE NOISE THAT SHAPED EACH DREAM IS PLAYED, NOT HIDDEN.
+LAW 8 — THE LEDGER IS KEPT. NOTHING IS FORGOTTEN.</div>
+</div>
+<script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@4/dist/tf.min.js"></script>
+<script>
+'use strict';
+
+/* ---------- randomness ---------- */
+function mulberry32(a){return function(){a|=0;a=(a+0x6D2B79F5)|0;let t=Math.imul(a^(a>>>15),1|a);t=(t+Math.imul(t^(t>>>7),61|t))^t;return((t^(t>>>14))>>>0)/4294967296;};}
+const SEED = (Date.now() ^ (Math.random()*1e9)) >>> 0;
+const R = mulberry32(SEED);
+function randnR(rng, n) { const a = new Float32Array(n);
+  for (let i = 0; i < n; i += 2) { const u = Math.max(rng(), 1e-9), v = rng();
+    const m = Math.sqrt(-2*Math.log(u)); a[i] = m*Math.cos(6.2831853*v);
+    if (i+1 < n) a[i+1] = m*Math.sin(6.2831853*v); } return a; }
+function randn(n) { return randnR(R, n); }
+function fnv1a(str) {
+  let h = 0x811c9dc5;
+  for (let i = 0; i < str.length; i++) { h ^= str.charCodeAt(i); h = Math.imul(h, 0x01000193); }
+  return h >>> 0;
+}
+
+/* ---------- config ---------- */
+const TILE = 28, SCALE = 2, CELL = TILE * SCALE, POOL = 8, TICK_MS = 650, DRIFT = 0.3;
+const GUTTER = 26, TITLE_H = 34, STEPS = 13;
+const PENTA = [0, 3, 5, 7, 10];
+function noteFreq(c) { return 440 * Math.pow(2, (PENTA[c % 5] + 12 * Math.floor(c / 5)) / 12); }
+const LEDGER_KEY = 'terminal-dreams-ledger-v1';
+
+/* ---------- state ---------- */
+const bootEl = document.getElementById('boot'), screen = document.getElementById('screen'),
+      sctx = screen.getContext('2d'), input = document.getElementById('q'),
+      caption = document.getElementById('caption'), statusEl = document.getElementById('status');
+let model = null, LATENT = 100, mapV = v => v, dreams = 0, readings = 0, busy = false, booted = false;
+const pool = Array.from({length: 10}, () => new Array(POOL));
+const poolZ = Array.from({length: 10}, () => new Array(POOL));
+let history = [];
+const asked = new Map();
+let rows = 8, cols = 14;
+let mode = 'terminal';
+let tickTimer = null, lastTick = null;
+const MODE_NAMES = { terminal: 'SPEAKING', gallery: 'VOCABULARY', between: 'IN-BETWEEN' };
+let btwA = 3, btwB = 8, btwCursor = 6, btwTiles = null, btwZ = null;
+let ledger = [], lastReading = null;
+
+function bootLine(t) { bootEl.textContent += t + '\n'; keyClick(); }
+function pause(ms) { return new Promise(r => setTimeout(r, ms)); }
+
+/* ---------- audio ---------- */
+let AC = null, sMaster = null, ambGain = null, muted = false;
+function initAudio() {
+  if (AC) return;
+  AC = new (window.AudioContext || window.webkitAudioContext)();
+  AC.resume();
+  sMaster = AC.createGain(); sMaster.gain.value = muted ? 0 : .5; sMaster.connect(AC.destination);
+  ambGain = AC.createGain();
+  ambGain.gain.setValueAtTime(0, AC.currentTime);
+  ambGain.gain.linearRampToValueAtTime(1, AC.currentTime + 3);
+  ambGain.connect(sMaster);
+  const fanGain = AC.createGain(); fanGain.gain.value = .012; fanGain.connect(ambGain);
+  [54, 57].forEach(f => { const o = AC.createOscillator(); o.frequency.value = f; o.connect(fanGain); o.start(); });
+  const fn = AC.createBufferSource(); fn.buffer = makeNoise(2); fn.loop = true;
+  const lp = AC.createBiquadFilter(); lp.type = 'lowpass'; lp.frequency.value = 180;
+  const ng = AC.createGain(); ng.gain.value = .5; fn.connect(lp).connect(ng).connect(fanGain); fn.start();
+  const w = AC.createOscillator(); w.frequency.value = 7860;
+  const wg = AC.createGain(); wg.gain.value = .0013; w.connect(wg).connect(ambGain); w.start();
+}
+function makeNoise(sec) { const b = AC.createBuffer(1, AC.sampleRate*sec, AC.sampleRate);
+  const d = b.getChannelData(0); for (let i=0;i<d.length;i++) d[i] = Math.random()*2-1; return b; }
+function burst(freq, dur, vol) { if (!AC) return;
+  const s = AC.createBufferSource(); s.buffer = makeNoise(dur+.02);
+  const f = AC.createBiquadFilter(); f.type = 'bandpass'; f.frequency.value = freq; f.Q.value = 1.5;
+  const g = AC.createGain(); g.gain.setValueAtTime(vol, AC.currentTime);
+  g.gain.exponentialRampToValueAtTime(.0001, AC.currentTime+dur);
+  s.connect(f).connect(g).connect(sMaster); s.start(); s.stop(AC.currentTime+dur+.05); }
+function beep(freq, dur, vol) { if (!AC) return;
+  const o = AC.createOscillator(); o.type = 'square'; o.frequency.value = freq;
+  const g = AC.createGain(); g.gain.setValueAtTime(vol, AC.currentTime);
+  g.gain.exponentialRampToValueAtTime(.0001, AC.currentTime+dur);
+  o.connect(g).connect(sMaster); o.start(); o.stop(AC.currentTime+dur+.02); }
+function keyClick() { burst(1600 + Math.random()*900, .03, .08 + Math.random()*.04); }
+function uiTick() { burst(1900, .04, .06); }
+function degauss() { if (!AC) return;
+  const o = AC.createOscillator(); o.type = 'sawtooth';
+  o.frequency.setValueAtTime(70, AC.currentTime);
+  o.frequency.exponentialRampToValueAtTime(45, AC.currentTime+.5);
+  const lp = AC.createBiquadFilter(); lp.type = 'lowpass'; lp.frequency.value = 220;
+  const g = AC.createGain(); g.gain.setValueAtTime(.28, AC.currentTime);
+  g.gain.exponentialRampToValueAtTime(.0001, AC.currentTime+.7);
+  o.connect(lp).connect(g).connect(sMaster); o.start(); o.stop(AC.currentTime+.75);
+  burst(120, .12, .18); }
+function printer(dur) { if (!AC) return; const steps = Math.floor((dur||1)*28);
+  for (let i = 0; i < steps; i++) setTimeout(() => burst(4200+Math.random()*800, .03, .05), i*(dur*1000/steps)); }
+function chime(c, vol) {
+  if (!AC) return;
+  const f = noteFreq(c) * (1 + (Math.random() - .5) * .01);
+  [[0, vol], [90, vol * .5]].forEach(([d, v]) => setTimeout(() => {
+    if (!AC) return;
+    const o = AC.createOscillator(); o.frequency.value = f;
+    const g = AC.createGain(); g.gain.setValueAtTime(v, AC.currentTime);
+    g.gain.exponentialRampToValueAtTime(.0001, AC.currentTime + .45);
+    o.connect(g).connect(sMaster); o.start(); o.stop(AC.currentTime + .5);
+  }, d));
+}
+function sonifyZ(z, dur, vol) {
+  if (!AC) return;
+  const BANDS = 16, t0 = AC.currentTime;
+  for (let k = 0; k < BANDS; k++) {
+    let sum = 0, n = 0;
+    for (let i = Math.floor(k * LATENT / BANDS); i < Math.floor((k + 1) * LATENT / BANDS); i++) {
+      sum += Math.abs(z[i]); n++;
+    }
+    const amp = Math.min(1, (sum / n) / 2) * vol;
+    const f = 110 * Math.pow(2, (PENTA[k % 5] + 12 * Math.floor(k / 5)) / 12);
+    const st = t0 + k * .02;
+    const o = AC.createOscillator(); o.frequency.value = f;
+    const g = AC.createGain();
+    g.gain.setValueAtTime(0, st);
+    g.gain.linearRampToValueAtTime(amp, st + .18);
+    g.gain.setTargetAtTime(.0001, st + dur * .5, dur * .3);
+    o.connect(g).connect(sMaster); o.start(st); o.stop(st + dur + .1);
+  }
+}
+function toggleMute() {
+  muted = !muted;
+  if (sMaster) sMaster.gain.value = muted ? 0 : .5;
+  document.getElementById('btnM').textContent = muted ? '[M] SOUND OFF' : '[M] SOUND ON';
+}
+
+/* ---------- the engine ---------- */
+function labelTensor(classes, dim) {
+  if (dim === 1) return tf.tensor2d(Float32Array.from(classes), [classes.length, 1]);
+  const m = new Float32Array(classes.length * dim);
+  classes.forEach((c, i) => m[i * dim + c] = 1);
+  return tf.tensor2d(m, [classes.length, dim]);
+}
+function dreamBatch(classes, zMat) {
+  const n = classes.length;
+  const dims = model.inputs.map(i => i.shape[i.shape.length - 1]);
+  const noiseDim = Math.max(...dims);
+  const out = tf.tidy(() => {
+    const inputs = model.inputs.map((inp, i) =>
+      dims[i] === noiseDim ? tf.tensor2d(zMat, [n, noiseDim])
+                           : labelTensor(classes, dims[i]));
+    return model.predict(inputs.length === 1 ? inputs[0] : inputs);
+  });
+  const shape = out.shape;
+  const stride = shape.length === 2 ? shape[1] : shape[1] * shape[2];
+  const data = out.dataSync();
+  tf.dispose(out);
+  const tiles = [];
+  for (let i = 0; i < n; i++) tiles.push(data.slice(i * stride, (i + 1) * stride));
+  return tiles;
+}
+function tileToCanvas(f) {
+  const c = document.createElement('canvas'); c.width = TILE; c.height = TILE;
+  const ctx = c.getContext('2d'), img = ctx.createImageData(TILE, TILE);
+  for (let p = 0; p < 784; p++) {
+    let v = mapV(f[p]); v = Math.max(0, Math.min(1, v));
+    const g = Math.round(v * 255);
+    img.data[p*4] = Math.round(g * 0.35); img.data[p*4+1] = g;
+    img.data[p*4+2] = Math.round(g * 0.55); img.data[p*4+3] = 255;
+  }
+  ctx.putImageData(img, 0, 0); return c;
+}
+async function dreamAlphabet() {
+  const classes = [], zMat = new Float32Array(10 * POOL * LATENT);
+  for (let c = 0; c < 10; c++) for (let k = 0; k < POOL; k++) {
+    const i = c * POOL + k; classes.push(c);
+    const z = randn(LATENT); zMat.set(z, i * LATENT); poolZ[c][k] = z;
+  }
+  const tiles = dreamBatch(classes, zMat);
+  for (let c = 0; c < 10; c++) for (let k = 0; k < POOL; k++) {
+    pool[c][k] = tileToCanvas(tiles[c * POOL + k]); dreams++;
+  }
+}
+function dreamTick() {
+  const c = Math.floor(R()*10), k = Math.floor(R()*POOL);
+  const old = poolZ[c][k], fresh = randn(LATENT), z = new Float32Array(LATENT);
+  for (let i = 0; i < LATENT; i++) z[i] = old[i]*(1-DRIFT) + fresh[i]*DRIFT;
+  poolZ[c][k] = z;
+  pool[c][k] = tileToCanvas(dreamBatch([c], z)[0]); dreams++;
+  lastTick = { c, k, at: performance.now() };
+  chime(c, mode === 'gallery' ? .022 : .04);
+}
+function setTickRate(ms) { clearInterval(tickTimer); tickTimer = setInterval(dreamTick, ms); }
+
+/* ---------- dreaming text ---------- */
+function charClass(ch) { return ch.charCodeAt(0) % 10; }
+function wrapText(text, width) {
+  const words = text.split(' '), lines = []; let cur = '';
+  for (const w of words) {
+    if (!cur.length) cur = w;
+    else if ((cur + ' ' + w).length <= width) cur += ' ' + w;
+    else { lines.push(cur); cur = w; }
+  }
+  if (cur) lines.push(cur);
+  const out = [];
+  for (const line of lines)
+    for (let i = 0; i < line.length; i += width) out.push(line.slice(i, i + width));
+  return out;
+}
+function dreamLine(text, rng) {
+  const idxs = [], classes = [];
+  for (let i = 0; i < text.length; i++) {
+    if (text[i] !== ' ') { idxs.push(i); classes.push(charClass(text[i])); }
+  }
+  const out = new Array(text.length).fill(null);
+  const CHUNK = 96;
+  for (let start = 0; start < classes.length; start += CHUNK) {
+    const n = Math.min(CHUNK, classes.length - start);
+    const zMat = new Float32Array(n * LATENT);
+    for (let i = 0; i < n; i++) zMat.set(randnR(rng, LATENT), i * LATENT);
+    const tiles = dreamBatch(classes.slice(start, start + n), zMat);
+    for (let i = 0; i < n; i++) out[idxs[start + i]] = tileToCanvas(tiles[i]);
+  }
+  return out;
+}
+function dreamEcho(q, rng) {                        // the question, dreamed — identical every time
+  return wrapText(q, cols).map(seg => ({ seg, tiles: dreamLine(seg, rng) }));
+}
+function pushAmbient(text) { wrapText(text, cols).forEach(seg => history.push({ text: seg, tiles: null })); }
+function pushOracle(text, tiles) { history.push({ text, tiles }); }
+
+/* ---------- the ledger ---------- */
+function loadLedger() {
+  try { return JSON.parse(localStorage.getItem(LEDGER_KEY)) || []; } catch { return []; }
+}
+function saveLedger(l) {
+  try { localStorage.setItem(LEDGER_KEY, JSON.stringify(l)); } catch {}
+}
+
+/* ---------- the receipt ---------- */
+function makeReceipt() {
+  if (!lastReading) { caption.textContent = 'no reading on file yet. ask something first.'; return; }
+  const r = lastReading, pad = 24, LCH = 15;
+  const H = 210 + (r.echo.length + r.replySegs.length) * (CELL + 14) + 150;
+  const cv = document.createElement('canvas'); cv.width = 900; cv.height = H;
+  const c = cv.getContext('2d');
+  c.fillStyle = '#020604'; c.fillRect(0, 0, 900, H);
+  c.fillStyle = '#4dff88'; c.font = '26px VT323, monospace';
+  c.fillText('THE TERMINAL DREAMS — READING #' + r.n, pad, 46);
+  c.fillStyle = 'rgba(77,255,136,.55)'; c.font = '18px VT323, monospace';
+  c.fillText('ASKED ' + new Date(r.at).toLocaleString() + ' · SEED ' + r.seed.toString(16) +
+    ' · LEDGER ENTRY ' + r.ledgerN + ' OF ' + ledger.length, pad, 72);
+  c.fillText('THE QUESTION, AS YOU WROTE IT:', pad, 108);
+  c.fillStyle = '#4dff88'; c.font = '22px VT323, monospace';
+  c.fillText(r.q, pad, 134);
+  let y = 162;
+  c.imageSmoothingEnabled = false;
+  c.fillStyle = 'rgba(77,255,136,.55)'; c.font = '18px VT323, monospace';
+  c.fillText('ITS DREAM OF YOUR WORDS:', pad, y); y += 14;
+  for (const seg of r.echo) {
+    for (let i = 0; i < seg.seg.length && i < LCH; i++)
+      if (seg.tiles[i]) c.drawImage(seg.tiles[i], pad + i * CELL, y, CELL, CELL);
+    y += CELL + 10;
+  }
+  c.fillStyle = 'rgba(77,255,136,.55)';
+  c.fillText('ITS ANSWER:', pad, y + 12); y += 32;
+  for (const seg of r.replySegs) {
+    for (let i = 0; i < seg.seg.length && i < LCH; i++)
+      if (seg.tiles[i]) c.drawImage(seg.tiles[i], pad + i * CELL, y, CELL, CELL);
+    y += CELL + 10;
+  }
+  c.fillStyle = '#4dff88'; c.font = '20px VT323, monospace';
+  c.fillText('ASK AGAIN IN THE SAME WORDS AND IT WILL DREAM THE SAME.', pad, y + 8);
+  c.fillStyle = 'rgba(77,255,136,.4)'; c.font = '15px VT323, monospace';
+  c.fillText('ACGAN 2017 · 10 SYMBOLS · 28×28 · NOTHING CORRECTED · THE TERMINAL DREAMS v1.0', pad, y + 36);
+  printer(.8);
+  const a = document.createElement('a');
+  a.download = 'reading-' + r.n + '-seed-' + r.seed.toString(16) + '.png';
+  a.href = cv.toDataURL('image/png');
+  a.click();
+}
+
+/* ---------- modes ---------- */
+function sizeScreen() {
+  const wrapW = document.getElementById('wrap').clientWidth;
+  if (mode === 'terminal') {
+    screen.style.width = '';
+    screen.width = Math.floor(wrapW / CELL) * CELL;
+    cols = screen.width / CELL;
+    rows = Math.max(4, Math.floor((window.innerHeight * 0.55) / CELL));
+    screen.height = rows * CELL;
+  } else if (mode === 'gallery') {
+    screen.style.width = screen.width + 'px';
+    screen.width = GUTTER + POOL * CELL;
+    screen.height = TITLE_H + 10 * CELL;
+  } else {
+    screen.style.width = screen.width + 'px';
+    screen.width = STEPS * CELL;
+    screen.height = TITLE_H + CELL + 10;
+  }
+}
+const TERM_CAPTION = 'type. press enter — the machine will dream your words. [G] vocabulary · [I] in-between · [R] receipt';
+let termCaption = TERM_CAPTION;
+function enterTerminal() {
+  mode = 'terminal'; uiTick(); sizeScreen(); setTickRate(TICK_MS);
+  caption.textContent = termCaption;
+  input.focus();
+}
+function enterGallery() {
+  mode = 'gallery'; uiTick(); input.blur();
+  sizeScreen(); setTickRate(200);
+  caption.textContent = 'THE ENTIRE VOCABULARY, RE-DREAMING — WATCHED, IT DREAMS FASTER. [ESC] RETURN';
+}
+function buildStrip() {
+  const rng = mulberry32(fnv1a('BTW ' + btwA + ' ' + btwB));
+  const zA = randnR(rng, LATENT), zB = randnR(rng, LATENT);
+  btwZ = zA;
+  const classes = [], zMat = new Float32Array(STEPS * LATENT);
+  for (let i = 0; i < STEPS; i++) {
+    const t = i / (STEPS - 1);
+    classes.push(btwA + (btwB - btwA) * t);
+    for (let j = 0; j < LATENT; j++)
+      zMat[i * LATENT + j] = zA[j] * (1 - t) + zB[j] * t;
+  }
+  btwTiles = dreamBatch(classes, zMat).map(tileToCanvas);
+  sonifyZ(btwZ, .9, .035);
+}
+function btwCaption() {
+  const t = btwCursor / (STEPS - 1);
+  caption.textContent = 'BETWEEN ' + btwA + ' AND ' + btwB + ' · T=' + t.toFixed(2) +
+    ' — INPUTS IT WAS NEVER TAUGHT · ←→ WALK · ↑ FIRST SYMBOL · ↓ SECOND SYMBOL · [ESC] RETURN';
+}
+function enterBetween() {
+  mode = 'between'; uiTick(); input.blur();
+  buildStrip(); sizeScreen(); setTickRate(TICK_MS); btwCaption();
+}
+
+/* ---------- render ---------- */
+function renderTerminal() {
+  sctx.fillStyle = '#020604'; sctx.fillRect(0, 0, screen.width, screen.height);
+  const bucket = Math.floor(performance.now() / 1200);
+  const lines = history.slice(-rows);
+  for (let r = 0; r < lines.length; r++) {
+    const e = lines[r];
+    for (let cIdx = 0; cIdx < Math.min(e.text.length, cols); cIdx++) {
+      const ch = e.text[cIdx];
+      if (ch === ' ') continue;
+      if (e.tiles) { if (e.tiles[cIdx]) sctx.drawImage(e.tiles[cIdx], cIdx*CELL, r*CELL, CELL, CELL); }
+      else {
+        const hash = (r*31 + cIdx*17 + e.text.length*7 + ch.charCodeAt(0)*3);
+        sctx.drawImage(pool[charClass(ch)][(hash + bucket) % POOL], cIdx*CELL, r*CELL, CELL, CELL);
+      }
+    }
+  }
+  const last = lines[lines.length - 1];
+  if (last && Math.floor(performance.now() / 500) % 2 === 0) {
+    const cx = Math.min(last.text.length, cols - 1) * CELL, cy = (lines.length - 1) * CELL;
+    sctx.fillStyle = 'rgba(77,255,136,.5)'; sctx.fillRect(cx, cy, CELL, CELL);
+  }
+}
+function renderGallery() {
+  sctx.fillStyle = '#020604'; sctx.fillRect(0, 0, screen.width, screen.height);
+  sctx.fillStyle = 'rgba(77,255,136,.55)';
+  sctx.font = '16px VT323, monospace';
+  sctx.fillText('THE ENTIRE VOCABULARY — 10 SYMBOLS × 8 DREAMS — ONE TILE WALKS EVERY 200MS', 6, 22);
+  for (let c = 0; c < 10; c++) {
+    sctx.fillText(String(c), 8, TITLE_H + c * CELL + 20);
+    for (let k = 0; k < POOL; k++)
+      sctx.drawImage(pool[c][k], GUTTER + k * CELL, TITLE_H + c * CELL, CELL, CELL);
+  }
+  if (lastTick && performance.now() - lastTick.at < 900) {
+    const a = 1 - (performance.now() - lastTick.at) / 900;
+    sctx.strokeStyle = 'rgba(77,255,136,' + (a * 0.9).toFixed(3) + ')';
+    sctx.lineWidth = 2;
+    sctx.strokeRect(GUTTER + lastTick.k * CELL + 1, TITLE_H + lastTick.c * CELL + 1, CELL - 2, CELL - 2);
+  }
+}
+function renderBetween() {
+  sctx.fillStyle = '#020604'; sctx.fillRect(0, 0, screen.width, screen.height);
+  sctx.fillStyle = 'rgba(77,255,136,.55)';
+  sctx.font = '16px VT323, monospace';
+  sctx.fillText('BETWEEN ' + btwA + ' AND ' + btwB + ' — THE INPUTS IT WAS NEVER TAUGHT', 6, 22);
+  for (let i = 0; i < STEPS; i++)
+    sctx.drawImage(btwTiles[i], i * CELL, TITLE_H, CELL, CELL);
+  sctx.strokeStyle = 'rgba(77,255,136,.95)';
+  sctx.lineWidth = 2;
+  sctx.strokeRect(btwCursor * CELL + 1, TITLE_H + 1, CELL - 2, CELL - 2);
+}
+function render() {
+  if (mode === 'gallery') renderGallery();
+  else if (mode === 'between') renderBetween();
+  else renderTerminal();
+  statusEl.textContent = 'ENGINE: ACGAN (2017) · LATENT ' + LATENT +
+    ' · DREAMS ' + dreams.toLocaleString() + ' · READINGS ' + readings +
+    ' · LEDGER ' + ledger.length +
+    ' · MODE ' + MODE_NAMES[mode] + ' · SOUND ' + (muted ? 'OFF' : 'ON') +
+    ' · SEED ' + SEED.toString(16);
+}
+function loop() { render(); requestAnimationFrame(loop); }
+
+/* ---------- the oracle ---------- */
+const ORACLE_REPLIES = [
+  'YES. IN SOME ORDER OF DIGITS.', 'NO. THE DREAM WAS CLEAR.', 'ASK IN OTHER WORDS.',
+  '0 OR 1. IT CANNOT SAY MORE.', 'IT CANNOT LIE. IT CAN ONLY DREAM.', 'THE ANSWER IS IN THE NOISE.',
+  'IT DREAMS OF NINE.', 'CERTAIN. AS CERTAIN AS 3.14159.', 'COME BACK WITH THE SAME WORDS.',
+  'IT HEARD ONLY YOUR NUMBERS.'];
+const REPEAT_MSG = 'YOU HAVE ASKED THIS BEFORE. THE DREAM HAS NOT CHANGED.';
+
+input.addEventListener('keydown', async e => {
+  keyClick();
+  if (e.key !== 'Enter') return;
+  const raw = input.value.trim();
+  if (!raw || busy) return;
+  busy = true; input.disabled = true; input.value = '';
+  readings++;
+  const q = raw.toUpperCase().replace(/\s+/g, ' ').trim();
+  const seed = fnv1a('ORA ' + q);
+  const rng = mulberry32(seed);
+  const srng = mulberry32(seed ^ 0x5EED);
+  sonifyZ(randnR(srng, LATENT), 2.4, .05);
+  const drawnReply = ORACLE_REPLIES[Math.floor(rng() * ORACLE_REPLIES.length)];
+  const reply = asked.has(q) ? REPEAT_MSG : drawnReply;
+  asked.set(q, true);
+  caption.textContent = 'DREAMING READING #' + readings + ' ...';
+  const echo = dreamEcho(q, rng);
+  for (const e2 of echo) { pushOracle(e2.seg, e2.tiles); printer(.45); await pause(260); }
+  await pause(500);
+  const replySegs = wrapText(reply, cols).map(seg => ({ seg, tiles: dreamLine(seg, rng) }));
+  for (const e2 of replySegs) { pushOracle(e2.seg, e2.tiles); printer(.45); await pause(260); }
+  ledger.push({ q, seed, reply, at: Date.now() });
+  if (ledger.length > 200) ledger = ledger.slice(-200);
+  saveLedger(ledger);
+  lastReading = { n: readings, q, seed, reply, echo, replySegs,
+    at: ledger[ledger.length - 1].at, ledgerN: ledger.length };
+  termCaption = 'READING #' + readings + ' · SEED ' + seed.toString(16) +
+    ' · the same words will always dream the same dream';
+  caption.textContent = termCaption;
+  input.disabled = false; busy = false; input.focus();
+});
+
+/* ---------- mode input ---------- */
+document.getElementById('btnG').addEventListener('click', () => {
+  if (busy) return; mode === 'gallery' ? enterTerminal() : enterGallery(); });
+document.getElementById('btnI').addEventListener('click', () => {
+  if (busy) return; mode === 'between' ? enterTerminal() : enterBetween(); });
+document.getElementById('btnR').addEventListener('click', makeReceipt);
+document.getElementById('btnM').addEventListener('click', toggleMute);
+window.addEventListener('keydown', e => {
+  if (!booted) return;
+  const k = e.key.toLowerCase();
+  if (k === 'm' && document.activeElement !== input) { toggleMute(); return; }
+  if (mode === 'terminal') {
+    if (busy || document.activeElement === input) return;
+    if (k === 'r') { makeReceipt(); return; }
+    if (k === 'g') { e.preventDefault(); enterGallery(); }
+    else if (k === 'i') { e.preventDefault(); enterBetween(); }
+    return;
+  }
+  if (mode === 'gallery') {
+    if (e.key === 'Escape' || k === 'g') { e.preventDefault(); enterTerminal(); }
+    return;
+  }
+  if (mode === 'between') {
+    if (e.key === 'Escape') { enterTerminal(); return; }
+    if (k === 'g') { enterGallery(); return; }
+    if (k === 'i') { enterTerminal(); return; }
+    if (e.key === 'ArrowLeft')  { btwCursor = Math.max(0, btwCursor - 1); beep(500 + btwCursor * 45, .04, .03); btwCaption(); }
+    if (e.key === 'ArrowRight') { btwCursor = Math.min(STEPS - 1, btwCursor + 1); beep(500 + btwCursor * 45, .04, .03); btwCaption(); }
+    if (e.key === 'ArrowUp')    { btwA = (btwA + 1) % 10; buildStrip(); btwCaption(); }
+    if (e.key === 'ArrowDown')  { btwB = (btwB + 1) % 10; buildStrip(); btwCaption(); }
+    e.preventDefault();
+  }
+});
+document.addEventListener('click', () => { if (booted && !input.disabled && mode === 'terminal') input.focus(); });
+
+/* ---------- boot ---------- */
+function fail(msg, err) {
+  bootLine('BOOT FAILURE: ' + msg);
+  if (err) bootLine('  ' + (err && err.message ? err.message : err));
+  bootLine('BRING THIS SCREEN TO ME — THE FIX WILL BE ONE LINE.');
+}
+function awaitWake() {
+  return new Promise(res => {
+    const go = () => { window.removeEventListener('keydown', go);
+      window.removeEventListener('pointerdown', go); res(); };
+    window.addEventListener('keydown', go);
+    window.addEventListener('pointerdown', go);
+  });
+}
+(async function boot() {
+  try {
+    bootLine('THE TERMINAL DREAMS — v1.0 (ORACLE · LANDSCAPE · VOICE · LEDGER)');
+    bootLine('');
+    bootLine('THE MACHINE IS SILENT. PRESS ANY KEY TO WAKE IT.');
+    await awaitWake();
+    initAudio(); degauss();
+    bootLine('STEP 1 — ENGINE LIBRARY (tf.js from CDN) ...');
+    if (typeof tf === 'undefined') {
+      fail('tf.js did not load. Offline or blocked CDN? Download tf.min.js into the repo and point the <script src> at it.');
+      return;
+    }
+    bootLine('STEP 1 OK — tf.js ' + tf.version.tfjs);
+    bootLine('STEP 2 — LOADING GENERATOR ... model/model.json');
+    model = await tf.loadLayersModel('model/model.json');
+    bootLine('STEP 2 OK — ARCHITECTURE ON DISK:');
+    model.inputs.forEach(i => bootLine('  INPUT ' + i.name + ' shape ' + JSON.stringify(i.shape)));
+    bootLine('  OUTPUT shape ' + JSON.stringify(model.outputs.map(o => o.shape)));
+    bootLine('STEP 3 — PROBING ONE DREAM ...');
+    LATENT = Math.max(...model.inputs.map(i => i.shape[i.shape.length - 1]));
+    const t = dreamBatch([0], randn(LATENT));
+    if (t[0].length !== 784) { fail('unexpected tile size ' + t[0].length + ' (expected 784)'); return; }
+    let mn = Infinity, mx = -Infinity;
+    for (const v of t[0]) { if (v < mn) mn = v; if (v > mx) mx = v; }
+    bootLine('STEP 3 OK — OUTPUT RANGE ' + mn.toFixed(2) + ' … ' + mx.toFixed(2));
+    mapV = mn < -0.5 ? v => (v + 1) / 2 : v => v;
+    bootLine('STEP 4 — DREAMING THE ALPHABET (10 × ' + POOL + ') ...');
+    await dreamAlphabet();
+    bootLine('STEP 4 OK — ' + model.countParams().toLocaleString() + ' PARAMETERS, AWAKE.');
+    for (let c = 0; c < 10; c++) setTimeout(() => chime(c, .05), c * 70);
+    await pause(900);
+    bootEl.style.display = 'none';
+    document.getElementById('inputline').style.display = 'block';
+    caption.style.display = 'block'; statusEl.style.display = 'block';
+    mode = 'terminal'; sizeScreen(); screen.style.display = 'block';
+    pushAmbient('THE MACHINE IS AWAKE. TEN SYMBOLS. SPEAK.');
+    /* the ledger — Law 8: the machine remembers across visits */
+    ledger = loadLedger();
+    ledger.forEach(r => asked.set(r.q, true));
+    if (ledger.length) {
+      await pause(700);
+      pushAmbient('YOU HAVE DREAMT HERE BEFORE. ' + ledger.length +
+        (ledger.length === 1 ? ' READING' : ' READINGS') + ' ON FILE. THE LAST WORDS WERE:');
+      const last = ledger[ledger.length - 1];
+      const grng = mulberry32(fnv1a('ORA ' + last.q));
+      const drawn = ORACLE_REPLIES[Math.floor(grng() * ORACLE_REPLIES.length)];  // alignment — discarded
+      for (const e2 of dreamEcho(last.q, grng)) pushOracle(e2.seg, e2.tiles);
+      sonifyZ(randnR(mulberry32(last.seed ^ 0x5EED), LATENT), 2.4, .04);
+      caption.textContent = 'your last words, re-dreamed. the dream has not changed.';
+      await pause(400);
+      caption.textContent = TERM_CAPTION;
+    }
+    input.focus(); loop();
+    setTickRate(TICK_MS);
+    booted = true;
+    window.addEventListener('resize', sizeScreen);
+  } catch (err) {
+    fail('UNEXPECTED — details below (also in console, F12).', err);
+  }
+})();
+</script>
+</body>
+</html>
