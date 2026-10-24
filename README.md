@@ -6,10 +6,9 @@ A web oracle whose every glyph is dreamed, live, by a 2017 neural
 network. You type in letters; it answers in digits — the only alphabet
 it was ever taught.
 
-**Play:** https://YOURNAME.github.io/terminal-dreams/
+**Play:** [Terminal Dreams](https://thinhnguyen5973.github.io/terminal-dreams/)
 
-Desktop browser recommended. Headphones recommended. No account, no
-server, nothing leaves your machine.
+Desktop browser recommended. Headphones recommended.
 
 ┌────────────────────────────────────────────────────┐ │ ▟▙ ▗▟▟ ▙▗ ▟▟▗ ▗▟▟ ▙▗▙ ▟▗ ▟▙▗ ▗▟▙ │ │ │ │ (every character above is a 28×28 digit, │ │ dreamed live by the model in this folder) │ │ │ │ > WILL I PASS_ │ │ │ │ YES. IN SOME ORDER OF DIGITS. │ │ READING #1 · SEED a3f91c │ │ the same words will always dream the same dream │ └────────────────────────────────────────────────────┘
 
@@ -36,7 +35,7 @@ perfectly repeatable — if you ask again in the same words.
 The piece was built by writing these laws first and refusing to break
 them. Every amendment is visible in the footer of the page.
 
-1. Every glyph is dreamed live by a 2017 neural network (the model file in this folder).
+1. Every glyph is dreamed live by a 2017 neural network.
 2. The machine hears no language. Your words are only seeds.
 3. Its output is 28×28 pixels. It is shown at 28×28, magnified as a loupe, nothing invented.
 4. Nothing is corrected.
